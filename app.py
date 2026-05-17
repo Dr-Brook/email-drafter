@@ -20,16 +20,16 @@ from src.prompts import build_prompt
 from src.ai_service import check_ollama_available, generate_email, regenerate_email
 from src.profile import PROFILE
 
-# ─── Auth (must be before page config) ────────────────────────────────────────
-pb_login_form()
-
-# ─── Page Config ────────────────────────────────────────────────────────────────
+# ─── Page config (must be first Streamlit call) ────────────────────────────────
 st.set_page_config(
     page_title="Email Drafter — Job Search",
     page_icon="✉️",
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+# ─── Auth (optional — login in sidebar to save/sync) ────────────────────────────
+pb_login_form(required=False)
 
 # ─── Custom CSS ─────────────────────────────────────────────────────────────────
 st.markdown("""
