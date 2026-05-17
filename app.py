@@ -14,10 +14,14 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).parent / ".env")
 
+from pb_auth import pb_login_form, get_pb_client, get_pb_user_id, pb_logout_button, pb_query
 from src.email_types import EMAIL_TYPES, TONES
 from src.prompts import build_prompt
 from src.ai_service import check_ollama_available, generate_email, regenerate_email
 from src.profile import PROFILE
+
+# ─── Auth (must be before page config) ────────────────────────────────────────
+pb_login_form()
 
 # ─── Page Config ────────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -68,15 +72,86 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+# ─── Pocketbase helpers ────────────────────────────────────────────────────────
+def load_history():
+    """Load email drafts from Pocketbase."""
+    client = get_pb_client()
+    user_id = get_pb_user_id()
+    if not client or not user_id:
+        return []
+    try:
+        items = pb_query("email_drafts", filter=f"user='{user_id}'", sort="-created")
+        return [
+            {
+                "id": item.get("id", ""),
+                "type": item.get("type", "cover_letter"),
+                "recipient": item.get("recipient", ""),
+                "subject": item.get("subject", ""),
+                "body": item.get("body", ""),
+                "tone": item.get("tone", "professional"),
+                "status": item.get("status", "draft"),
+                "created": item.get("created", ""),
+            }
+            for item in items
+        ]
+    except Exception:
+        return []
+
+
+def save_draft(email_type, recipient, subject, body, tone, status="draft"):
+    """Save an email draft to Pocketbase."""
+    client = get_pb_client()
+    user_id = get_pb_user_id()
+    if not client or not user_id:
+        return None
+    try:
+        record = client.collection("email_drafts").create({
+            "user": user_id,
+            "type": email_type,
+            "recipient": recipient,
+            "subject": subject,
+            "body": body,
+            "tone": tone,
+            "status": status,
+        })
+        return record.id
+    except Exception as e:
+        st.error(f"Failed to save draft: {e}")
+        return None
+
+
+def update_draft_status(draft_id, status):
+    """Update the status of an email draft."""
+    client = get_pb_client()
+    if not client:
+        return
+    try:
+        client.collection("email_drafts").update(draft_id, {"status": status})
+    except Exception:
+        pass
+
+
+def delete_draft(draft_id):
+    """Delete an email draft."""
+    client = get_pb_client()
+    if not client:
+        return
+    try:
+        client.collection("email_drafts").delete(draft_id)
+    except Exception:
+        pass
+
+
 # ─── Session State ──────────────────────────────────────────────────────────────
 if "current_email" not in st.session_state:
     st.session_state.current_email = ""
     st.session_state.current_prompt = ""
-    st.session_state.history = []
+    st.session_state.current_draft_id = None
 
 # ─── Sidebar ────────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("### ✉️ Email Drafter")
+    pb_logout_button()
     st.markdown("---")
 
     # AI Status
@@ -102,16 +177,24 @@ with st.sidebar:
 
     st.markdown("---")
 
-    # Email history
+    # Email history from Pocketbase
     st.markdown("#### 📜 History")
-    if st.session_state.history:
-        for i, item in enumerate(reversed(st.session_state.history)):
+    history = load_history()
+    if history:
+        for item in history:
             email_type_label = EMAIL_TYPES.get(item["type"], {}).get("label", item["type"])
-            if st.button(f"{email_type_label} → {item['recipient']}", key=f"hist_{i}"):
-                st.session_state.current_email = item["email"]
-                st.rerun()
+            col1, col2 = st.columns([4, 1])
+            with col1:
+                if st.button(f"{email_type_label} → {item['recipient']}", key=f"hist_{item['id']}"):
+                    st.session_state.current_email = item["body"]
+                    st.session_state.current_draft_id = item["id"]
+                    st.rerun()
+            with col2:
+                if st.button("🗑️", key=f"del_{item['id']}"):
+                    delete_draft(item["id"])
+                    st.rerun()
     else:
-        st.caption("No emails generated yet")
+        st.caption("No emails saved yet")
 
     st.markdown("---")
     st.caption("Built by **Brook Eshete, MD, MPH**")
@@ -188,7 +271,6 @@ with col2:
 
 # ─── Generate ──────────────────────────────────────────────────────────────────
 if generate_btn:
-    # Filter out empty fields
     filled_fields = {k: v for k, v in form_fields.items() if v}
     if not filled_fields:
         st.warning("Please fill in at least a few fields before generating.")
@@ -199,15 +281,10 @@ if generate_btn:
             try:
                 email = generate_email(prompt)
                 st.session_state.current_email = email
-                # Save to history
+                # Save to Pocketbase
                 recipient = filled_fields.get("recipient_name", "Unknown")
-                st.session_state.history.append({
-                    "type": email_type,
-                    "recipient": recipient,
-                    "email": email,
-                    "fields": filled_fields,
-                    "tone": tone,
-                })
+                draft_id = save_draft(email_type, recipient, "", email, tone)
+                st.session_state.current_draft_id = draft_id
             except Exception as e:
                 st.error(f"Error generating email: {e}")
         st.rerun()
@@ -217,9 +294,13 @@ if regenerate_btn and st.session_state.current_email:
         try:
             email = regenerate_email(st.session_state.current_prompt, tweak)
             st.session_state.current_email = email
-            # Update last history item
-            if st.session_state.history:
-                st.session_state.history[-1]["email"] = email
+            # Update the current draft in Pocketbase
+            if st.session_state.current_draft_id:
+                client = get_pb_client()
+                if client:
+                    client.collection("email_drafts").update(
+                        st.session_state.current_draft_id, {"body": email}
+                    )
         except Exception as e:
             st.error(f"Error regenerating email: {e}")
     st.rerun()
@@ -231,5 +312,24 @@ if st.session_state.current_email:
 
     # Copy button
     st.code(st.session_state.current_email, language=None)
+
+    # Draft actions
+    if st.session_state.current_draft_id:
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            if st.button("✅ Mark as Sent"):
+                update_draft_status(st.session_state.current_draft_id, "sent")
+                st.success("Marked as sent!")
+                st.rerun()
+        with col2:
+            if st.button("📦 Archive"):
+                update_draft_status(st.session_state.current_draft_id, "archived")
+                st.success("Archived!")
+                st.rerun()
+        with col3:
+            if st.button("🗑️ Delete Draft"):
+                delete_draft(st.session_state.current_draft_id)
+                st.session_state.current_draft_id = None
+                st.rerun()
 
     st.caption("Copy the text above to paste into your email client.")
